@@ -275,7 +275,20 @@ static void slow_report(const char *when) {        /* which thread made the hold
     b[o] = 0;
     if (o) LOG("r1: hold %s: slow threads:%s\n", when, b);
 }
-static void unpark(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; } }
+/* rollback round 2, SSBU_R1_AUDIO_HOLD=1: the audio threads stay suspended from the save to the end of the re-run (as the
+ * run-ahead does): they draw from the game's random numbers and keep host-side audio state, so letting them run in the
+ * window and then rolling their memory back put the game's and the host's audio out of step (crashes in
+ * nus3::audio update) or, left out of the snapshot (SSBU_R1_AUDIO_FREE), shifted the random sequence of the re-run */
+static int g_audio_hold = -1, g_aud_cnt[256];
+static int is_audio_th(const char *n) { return n && (strstr(n, "nus3") || strstr(n, "udio") || strstr(n, "sindou")); }
+static void unpark(void) {
+    if (g_audio_hold < 0) g_audio_hold = getenv("SSBU_R1_AUDIO_HOLD") != NULL;
+    for (int i = 0; i < g_nth; i++) if (g_th[i].held) {
+        if (g_audio_hold && is_audio_th(g_th[i].name)) { g_aud_cnt[i]++; g_th[i].held = 0; continue; }      /* stays suspended */
+        ResumeThread(g_th[i].h); g_th[i].held = 0;
+    }
+}
+static void audio_release(void) { for (int i = 0; i < g_nth; i++) while (g_aud_cnt[i] > 0) { ResumeThread(g_th[i].h); g_aud_cnt[i]--; } }
 static void restore_thread_regs(void) {     /* callee-saved registers + sp of each thread held at the same wait as at the save */
     for (int i = 0; i < g_nth; i++) {
         Th *t = &g_th[i];
@@ -1101,6 +1114,19 @@ static LONG CALLBACK r1_veh(EXCEPTION_POINTERS *e) {
     { HMODULE m = NULL; char mn[MAX_PATH] = "?"; if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)e->ContextRecord->Rip, &m)) GetModuleFileNameA(m, mn, MAX_PATH);
       LOG("r1: CRASH module %s +%llx; rcx %llx rdx %llx; TEB fiber data %p; [rsp] %llx %llx %llx %llx\n", mn, (unsigned long long)(e->ContextRecord->Rip - (uint64_t)(uintptr_t)m), (unsigned long long)e->ContextRecord->Rcx, (unsigned long long)e->ContextRecord->Rdx, GetCurrentFiber(),
           (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[0], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[1], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[2], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[3]); }
+    {   /* rollback round 2: the host return addresses above rsp (code of this exe or a module), to name with the map */
+        char b[2048]; int o = 0, k = 0;
+        for (uint64_t *p = (uint64_t *)(uintptr_t)g_veh_rsp; k < 28 && (uint8_t *)p < (uint8_t *)(uintptr_t)g_veh_rsp + 24576; p++) {
+            MEMORY_BASIC_INFORMATION mi;
+            if (((uintptr_t)p & 4095) == 0 && (!VirtualQuery(p, &mi, sizeof mi) || mi.State != MEM_COMMIT)) break;
+            HMODULE m = NULL;
+            if (*p < 0x10000 || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)*p, &m)) continue;
+            char mn[MAX_PATH]; GetModuleFileNameA(m, mn, MAX_PATH); const char *bn = strrchr(mn, '\\') ? strrchr(mn, '\\') + 1 : mn;
+            o += snprintf(b + o, sizeof b - o, " [+%llx] %s+%llx", (unsigned long long)((uint8_t *)p - (uint8_t *)(uintptr_t)g_veh_rsp), bn, (unsigned long long)(*p - (uint64_t)(uintptr_t)m));
+            if (o > 1900) break; k++;
+        }
+        LOG("r1: CRASH stack:%s\n", b);
+    }
     os_r1_fibers(veh_fib_cb);
     if (!g_veh_hits) LOG("r1: CRASH rsp is on no fiber's host stack\n");
     return EXCEPTION_CONTINUE_SEARCH;
@@ -1557,6 +1583,7 @@ static void r1_frame_end(Ctx *c, void *user) {
         LOG("r1: re-run %d frames in %.2f ms (%.2f ms per frame); %d of %d recorded pad polls given\n", g_k_run, g_t_rerun, g_t_rerun / g_k_run, g_ipad, g_npad);
         if (g_mark <= 0 && (!(g_fast > 0 && g_cycle >= g_learn) || g_fcheck)) verify();
         release(); g_fe_busy = 1;
+        audio_release();                                          /* SSBU_R1_AUDIO_HOLD: the audio threads go on */
         g_cycle++;
         if (g_cycle < g_c) { g_phase = 0; g_target = g_ff + g_p - g_k_run; } else { g_phase = 3; LOG("r1: done, %d cycles\n", g_cycle); fast_report(); mark_report(); if (g_prot > 0) prot_report(); r1_stats_report(); }
     }
