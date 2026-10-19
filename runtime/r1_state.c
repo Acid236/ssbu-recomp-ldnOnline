@@ -314,6 +314,7 @@ void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stac
  * copied with its guest context (Ctx); a restore puts all three back when the fiber is switched away then too. */
 #define FIB_BLOCK 0x500
 typedef struct { uint64_t key; uint64_t obj[6]; void *fls; uint8_t flsb[392]; Ctx *c; void *fiber; Ctx regs; const char *imp; uint64_t from, sp; int susp; uint8_t blk[FIB_BLOCK]; uint8_t *stk; size_t n; uint64_t rsp; } Fib;
+static int g_fib_other_running, g_fib_other_tries; static uint64_t g_fib_other_key, g_fib_other_from; static DWORD g_fib_other_tid; static const char *g_fib_other_imp;      /* rollback round 5: fibers running on another thread at the save */
 static Fib g_fib[1024]; static int g_fib_running, g_nfib, g_fib_mode, g_fib_same, g_fib_diff, g_fib_new, g_fib_bad;
 void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh);
 void os_r1_fiber_get(uint64_t key, uint64_t v[6]); void os_r1_fiber_put(uint64_t key, const uint64_t v[6]);
@@ -374,6 +375,7 @@ static void fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fi
         }
     } else if (!tid) g_fib_bad++;
     if (tid) g_fib_running++;
+    if (tid && tid != GetCurrentThreadId()) { g_fib_other_running++; g_fib_other_key = key; g_fib_other_tid = tid; g_fib_other_imp = c ? c->in_import : NULL; g_fib_other_from = c ? c->import_from : 0; }
 }
 static void fibers_restore_all(void) {
     g_ncur = 0; g_fib_mode = 1; os_r1_fibers(fib_cb);
@@ -451,7 +453,7 @@ static void park_quiet(int restore_mode) {
         unpark(); SwitchToThread();
     }
 }
-static void fibers_save(void) { g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
+static void fibers_save(void) { g_fib_other_running = 0; g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
 static void fibers_restore(void) {
     fibers_restore_all();
     /* rollback round 3: a fiber object the game made in the window has, after the restore, no state in guest memory (or an
@@ -507,6 +509,19 @@ static void save(Ctx *c) {
         }
     }
     fibers_save();
+    if (g_ra <= 0 && g_fib_other_running && getenv("SSBU_R1_NO_RUNNING_FIBERS") && ++g_fib_other_tries <= 30) {      /* opt-in: the one seen is TaskWorker2's idle loop (WaitLightEvent @710354a5a8), there at every save point */
+        /* rollback round 5: a fiber running on ANOTHER thread (held at a wait inside a job) keeps host state that the
+         * snapshot does not have: lifted code holds guest values in host registers / locals across that wait, and if the
+         * job goes round and waits at the same place again before the restore, it continues with values of the first
+         * pass (the coroutine trap at lua2cpp_common+0x52e434: a stale pointer into a guest stack). No save now. */
+        { const char *tn = "?"; Ctx *tc2; const char *nm2; HANDLE h2; for (int q = 0; guest_thread_info(q, &tc2, &nm2, &h2); q++) if (h2 && GetThreadId(h2) == g_fib_other_tid) tn = nm2 ? nm2 : "?";
+          LOG("r1: save at fight frame %lld not now (%d): %d fiber(s) running on another thread (e.g. %llx on %s, thread %lu, in %s @%llx)\n", g_ff, g_fib_other_tries, g_fib_other_running, (unsigned long long)g_fib_other_key, tn, (unsigned long)g_fib_other_tid, g_fib_other_imp ? g_fib_other_imp : "guest code", (unsigned long long)g_fib_other_from); }
+        unpark(); audio_release();
+        for (int k = 0; k < g_nr; k++) { free(g_r[k].s); g_r[k].s = NULL; free(g_r[k].dirty); g_r[k].dirty = NULL; free(g_r[k].async); g_r[k].async = NULL; }
+        g_save_failed = 1; return;
+    }
+    if (g_fib_other_running) LOG("r1: saving with %d fiber(s) running on another thread (after %d tries)\n", g_fib_other_running, g_fib_other_tries - 1);
+    g_fib_other_tries = 0;
     double t1b = now_ms();
     for (int i = 0; i < g_nr; i++) { memcpy(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
     double t2 = now_ms();

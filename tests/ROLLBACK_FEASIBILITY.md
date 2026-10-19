@@ -114,3 +114,22 @@ kicked, 2 = the render group, 4 = the logic groups. CPU per frame is measured wi
 - The coroutine trap (`lua2cpp_common+0x52e434`) is back in these runs, earlier with mask 1 (1st-2nd cycle): the reset
   of fibers born in the window covers part of the cases only. Next: log the fiber objects' life (initialise / finalise /
   first switch) across save, window and restore to find the other case.
+
+# Round 5 (2026-10-19): what skipping costs
+
+- Pages that differ after the re-run, from the first pass's end state: ~50 with nothing skipped (round 3), 1399 of 1940
+  with `SSBU_R1_RERUN_SKIP=1`. The fighters' lines are still equal, but the render preparation also advances state the
+  next frames use (animation, effects): run-ahead can leave it out because its speculative pass is thrown away; a
+  rollback keeps its re-simulated frames, so it cannot. The coroutine trap also comes back sooner with mask 1.
+- So a re-simulated frame costs about a full frame without the GPU submission: ~7.3 ms on the main thread + ~5.4 ms on
+  the task workers in parallel (round 4, first pass). With ~7 ms for the normal frame, ONE re-simulated frame fits in a
+  16.7 ms frame on this PC, two do not.
+- The fiber always found running on another thread at the save point is TaskWorker2's idle loop (WaitLightEvent
+  @710354a5a8), a consistent state (run-ahead relies on it). Waiting for a save point without it never succeeds
+  (3000 tries); `SSBU_R1_NO_RUNNING_FIBERS=1` keeps that check as an option.
+
+Consequence for the design: a full rollback (3-7 frames, as Slippi) does not fit this engine on this PC without
+separating the logic from the render preparation, which is deep engine work. What fits: a SHORT rollback of 1 frame
+(at most 2 on a faster CPU) on top of a delay: e.g. delay 2 + rollback 1 covers what delay 3 covers today, with the
+input lag of delay 2; the misprediction cost is one re-simulated frame. Still needed for it: a save every frame in
+~2 ms (FAST mode), and the intermittent coroutine trap fixed.
