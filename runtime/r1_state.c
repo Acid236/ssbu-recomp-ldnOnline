@@ -1567,7 +1567,7 @@ static void r1_stats_now(void) {
  * preparation jobs of the next frame are in flight on the task workers (a restore there left command buffers recorded
  * past the save point and fibers mid-job: "command handle unknown or expired", then a guest trap). As run-ahead, the
  * task workers are held from the kick before (0x71037494f8, H1: they are idle there) to that point (H2). */
-static int g_at_kick = -1, g_kick_due;
+static int g_at_kick = -1, g_kick_due; static long long g_r1_skipped;
 static ImportFn g_orig_r1k;
 static void r1_act(Ctx *c);
 static void ra_workers_hold(void); static void ra_workers_release(void);
@@ -1578,6 +1578,15 @@ static void r1_kick2(Ctx *c, void *user) {
     if (lr == 0x7103749b24ull) {                                                                     /* H2 */
         if (g_kick_due) { g_kick_due = 0; r1_act(c); }
         ra_workers_release();
+    }
+    /* rollback round 4, SSBU_R1_RERUN_SKIP=<mask> (as run-ahead's SSBU_RUNAHEAD_SKIP): in the re-run, the job groups of the
+     * render side are not kicked, so a re-simulated frame runs the logic only (1 = the preparation kicks, 2 = the render
+     * kick, 4 = the logic kicks: only for tests) */
+    static int skip = -1; if (skip < 0) { const char *e = getenv("SSBU_R1_RERUN_SKIP"); skip = e ? atoi(e) : 0; }
+    if (skip && g_phase == 2) {
+        int prep = lr == 0x7103749b24ull || lr == 0x710374b4f8ull || lr == 0x710374b528ull || lr == 0x710374b558ull, rend = lr == 0x710374c0d8ull;
+        int logic = lr == 0x710374c398ull || lr == 0x710374c5b8ull;
+        if (((skip & 1) && prep) || ((skip & 2) && rend) || ((skip & 4) && logic)) { g_r1_skipped++; return; }
     }
     g_orig_r1k(c);
 }
@@ -1597,6 +1606,20 @@ static void r1_frame_end(Ctx *c, void *user) {
     if (g_at_kick) { g_kick_due = 1; return; }          /* SSBU_R1_AT_KICK: the save / restore runs at the next kick after the submission */
     r1_act(c);
 }
+static double cpu_ms(void) {      /* this thread's CPU time: its cycle count (QueryThreadCycleTime) at the rate calibrated once on the clock */
+    static double cyc_per_ms;
+    if (!cyc_per_ms) { ULONG64 c0, c1; QueryThreadCycleTime(GetCurrentThread(), &c0); double t0 = now_ms(); while (now_ms() - t0 < 20.0) { } QueryThreadCycleTime(GetCurrentThread(), &c1); cyc_per_ms = (double)(c1 - c0) / (now_ms() - t0); }
+    ULONG64 c; QueryThreadCycleTime(GetCurrentThread(), &c); return (double)c / cyc_per_ms;
+}
+static double g_cpu_mark, g_cpu_pass1;
+static double g_cpu_w_mark, g_cpu_w_pass1;   /* the same for the task workers (the logic's job groups run there too) */
+static double workers_ms(void) {
+    static double cyc_per_ms; if (!cyc_per_ms) { double t = cpu_ms(); (void)t; ULONG64 c0, c1; QueryThreadCycleTime(GetCurrentThread(), &c0); double t0 = now_ms(); while (now_ms() - t0 < 5.0) { } QueryThreadCycleTime(GetCurrentThread(), &c1); cyc_per_ms = (double)(c1 - c0) / (now_ms() - t0); }
+    ULONG64 sum = 0, c;
+    for (int i = 0; i < g_nth; i++) if (g_th[i].name && strstr(g_th[i].name, "TaskWorker") && QueryThreadCycleTime(g_th[i].h, &c)) sum += c;
+    return (double)sum / cyc_per_ms;
+}
+      /* rollback round 4: main thread CPU time of the first pass / the re-run (no wait for the display in it) */
 /* the R1 state machine: save at fight frame N, restore K frames later, verify at the end of the re-run */
 static void r1_act(Ctx *c) {
     if (g_ff > 0 && g_phase < 3) {
@@ -1608,18 +1631,19 @@ static void r1_act(Ctx *c) {
         g_postponed = 0;
         if (g_mark > 0) { if (g_cycle == 0) save(c); else mark_save(c); }      /* (cycle 0: save() starts the marks itself) */
         else if (g_fast > 0 && g_cycle >= g_learn) { if (!g_nfp) fast_build(); if (g_fcheck) save(c); fast_save(c); } else { g_save_failed = 0; save(c); if (g_save_failed) { g_save_failed = 0; return; } }      /* not now: the next frame end */
-        g_phase = 1; g_fe_busy = 1; g_npad = 0; g_save_ff = g_ff; g_target = g_ff + g_k; g_t_mark = now_ms();
+        g_phase = 1; g_fe_busy = 1; g_npad = 0; g_save_ff = g_ff; g_target = g_ff + g_k; g_t_mark = now_ms(); g_cpu_mark = cpu_ms(); g_cpu_w_mark = workers_ms();
     } else if (g_phase == 1 && g_ff >= g_target) {
         if (g_postponed) LOG("r1: restore postponed %d frame end(s): a fiber was in the middle of a job\n", g_postponed);
         g_postponed = 0; g_k_run = (int)(g_ff - g_save_ff);
-        g_t_pass1 = now_ms() - g_t_mark;
+        g_t_pass1 = now_ms() - g_t_mark; g_cpu_pass1 = cpu_ms() - g_cpu_mark; g_cpu_w_pass1 = workers_ms() - g_cpu_w_mark;
         if (g_mark > 0) mark_restore(c);
         else if (g_fast > 0 && g_cycle >= g_learn) fast_restore(c); else restore(c);
-        g_phase = 2; g_fe_busy = 1; g_ipad = 0; g_ff = g_save_ff; g_target = g_ff + g_k_run; g_t_mark = now_ms();
+        g_phase = 2; g_fe_busy = 1; g_ipad = 0; g_ff = g_save_ff; g_target = g_ff + g_k_run; g_t_mark = now_ms(); g_cpu_mark = cpu_ms(); g_cpu_w_mark = workers_ms();
         if (g_ar) LOG("r1: guest C heap: %llu allocations, %llu frees so far (counters inside the heap: rolled back too)\n", (unsigned long long)((uint64_t *)g_ar)[50], (unsigned long long)((uint64_t *)g_ar)[51]);
         LOG("r1: first pass %d frames in %.2f ms (%.2f ms per frame, wall, render included); %d pad polls recorded\n", g_k_run, g_t_pass1, g_t_pass1 / g_k_run, g_npad);
     } else if (g_phase == 2 && g_ff == g_target) {
         g_t_rerun = now_ms() - g_t_mark;
+        LOG("r1: CPU per frame: main thread first pass %.2f ms, re-run %.2f ms; task workers first pass %.2f ms, re-run %.2f ms (%lld job group kicks skipped in re-runs so far)\n", g_cpu_pass1 / g_k_run, (cpu_ms() - g_cpu_mark) / g_k_run, g_cpu_w_pass1 / g_k_run, (workers_ms() - g_cpu_w_mark) / g_k_run, g_r1_skipped);
         LOG("r1: re-run %d frames in %.2f ms (%.2f ms per frame); %d of %d recorded pad polls given\n", g_k_run, g_t_rerun, g_t_rerun / g_k_run, g_ipad, g_npad);
         if (g_mark <= 0 && (!(g_fast > 0 && g_cycle >= g_learn) || g_fcheck)) verify();
         release(); g_fe_busy = 1;

@@ -94,3 +94,23 @@ preparation (run-ahead already skips the preparation kicks of its speculative pa
 next step, and it also gives the logic-only re-simulation time.
 
 `nnunwind.c` now also lists, when a handler finds no catch record, the records within 64 KB of that frame (diagnostic).
+
+# Round 4 (2026-10-19): re-simulated frames without the render preparation
+
+`SSBU_R1_RERUN_SKIP=<mask>` (as run-ahead's `SSBU_RUNAHEAD_SKIP`): in the re-run, 1 = the preparation job groups are not
+kicked, 2 = the render group, 4 = the logic groups. CPU per frame is measured with QueryThreadCycleTime (GetThreadTimes'
+15.6 ms resolution gave nothing): the main thread, and the task workers summed.
+
+| | main thread | task workers |
+|---|---|---|
+| first pass (logic + render preparation) | 7.3 ms | 5.4 ms |
+| re-run with mask 1 (no preparation) | 5.4 ms | 3.0 ms |
+
+- Mask 1: the re-run stays identical to the first pass (fighters' lines). Re-simulating costs ~5.4 ms a frame on the
+  main thread (the critical path; the workers run in parallel): with a normal frame of ~7 ms, 1-2 re-simulated frames
+  fit in a 16.7 ms frame on this PC (Ryzen-class desktop, RTX 2080 SUPER).
+- Mask 2/3 (render group skipped): the game hangs at the first re-run (the main loop waits for that group's counter).
+  The group must be completed without running it (its counter / events set), not just left out.
+- The coroutine trap (`lua2cpp_common+0x52e434`) is back in these runs, earlier with mask 1 (1st-2nd cycle): the reset
+  of fibers born in the window covers part of the cases only. Next: log the fiber objects' life (initialise / finalise /
+  first switch) across save, window and restore to find the other case.
