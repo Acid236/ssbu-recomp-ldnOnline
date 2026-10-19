@@ -314,6 +314,14 @@ static void eh_raise(Ctx *c, int reason) {
         jmp_buf *jb = catch_take(cfa, NULL);
         if (!jb) {
             printf("\nunwind: f_%llx handled an exception but was not entered through nro_catch_call (frame %llx)\n", (unsigned long long)pad.function.start, (unsigned long long)cfa);
+            {   /* rollback round 3: the records near that frame (same guest stack within 64 KB), to tell a lost record from one under another key */
+                int shown = 0;
+                for (unsigned i = 0; i < CATCH_SLOTS && shown < 16; i++) {
+                    uint64_t k = g_catch[i].cfa;
+                    if (k > 1 && (k > cfa ? k - cfa : cfa - k) < 0x10000) { printf("unwind:   record slot %u: frame %llx (%+lld) jb %p\n", i, (unsigned long long)k, (long long)(k - cfa), (void *)g_catch[i].jb); shown++; }
+                }
+                printf("unwind:   %d records within 64 KB of that frame; host sp now %p\n", shown, (void *)&shown);
+            }
             eh_terminate(c, "no host frame to return to");
         }
         __builtin_longjmp((void **)*jb, 1);

@@ -454,7 +454,13 @@ static void park_quiet(int restore_mode) {
 static void fibers_save(void) { g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
 static void fibers_restore(void) {
     fibers_restore_all();
-    int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == g_cur[j].key) break; if (i == g_nfib) born++; }
+    /* rollback round 3: a fiber object the game made in the window has, after the restore, no state in guest memory (or an
+     * older one), but its host fiber still sits in the middle of what it ran in the first pass. When the re-run initialises
+     * it again, the host must start it from the beginning (as a fiber that never ran at the save): left as it was, it resumed
+     * mid-function (a lua2cpp coroutine: "indirect call to lua2cpp_common+0x52e434", or its L2CExceptionShutdown handler
+     * finding no catch record -> std::terminate). SSBU_R1_KEEP_BORN_FIBERS=1: the old behaviour. */
+    int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == g_cur[j].key) break;
+        if (i == g_nfib) { born++; if (!getenv("SSBU_R1_KEEP_BORN_FIBERS") && !g_cur[j].tid) os_r1_fiber_set(g_cur[j].key, NULL, NULL, 1); } }
     Ctx *tc; const char *nm; HANDLE h; int nt = 0; for (int i = 0; guest_thread_info(i, &tc, &nm, &h); i++) nt++;
     if (g_nborn) LOG("r1: %d guest threads created in the window, held for good at the restore:%s\n", g_nborn, g_born);
     LOG("r1: in the window: %d fiber objects made that the save did not have; guest threads now %d (at the save %d + this one)\n", born, nt, g_nth);
@@ -1556,6 +1562,25 @@ static void r1_stats_now(void) {
         LOG("r1: TIMING %s frames (%lld): poll -> frame end %.3f ms, frame end call %.3f ms, frame end -> frame end %.3f ms (means, main thread, wall)\n",
             k ? "re-run" : "normal", g_stn[k], g_st[k][0] / g_stn[k], g_st[k][1] / g_stn[k], g_st[k][2] / g_stn[k]);
 }
+/* rollback round 3, SSBU_R1_AT_KICK=1: R1 saves and restores where run-ahead does, at the kick right after the
+ * submission (FUN 0x7103549170 called from 0x7103749b20), not at the main loop's frame end: at the frame end the render
+ * preparation jobs of the next frame are in flight on the task workers (a restore there left command buffers recorded
+ * past the save point and fibers mid-job: "command handle unknown or expired", then a guest trap). As run-ahead, the
+ * task workers are held from the kick before (0x71037494f8, H1: they are idle there) to that point (H2). */
+static int g_at_kick = -1, g_kick_due;
+static ImportFn g_orig_r1k;
+static void r1_act(Ctx *c);
+static void ra_workers_hold(void); static void ra_workers_release(void);
+static void r1_kick2(Ctx *c, void *user) {
+    (void)user;
+    uint64_t lr = c->x[30];
+    if (lr == 0x71037494fcull && g_ff > 0 && g_phase < 3) ra_workers_hold();                       /* H1 */
+    if (lr == 0x7103749b24ull) {                                                                     /* H2 */
+        if (g_kick_due) { g_kick_due = 0; r1_act(c); }
+        ra_workers_release();
+    }
+    g_orig_r1k(c);
+}
 static void r1_frame_end(Ctx *c, void *user) {
     (void)user;
     uint64_t lr = c->x[30];
@@ -1569,6 +1594,11 @@ static void r1_frame_end(Ctx *c, void *user) {
     g_t_fe_prev = te;
     { static long long nfe; if (++nfe % 600 == 0) { LOG("r1: (frame end %lld)\n", nfe); r1_stats_now(); } } { int ph = g_phase; static int last_ph; g_fe_busy = 0; (void)last_ph; last_ph = ph; }
     fls_index_find();
+    if (g_at_kick) { g_kick_due = 1; return; }          /* SSBU_R1_AT_KICK: the save / restore runs at the next kick after the submission */
+    r1_act(c);
+}
+/* the R1 state machine: save at fight frame N, restore K frames later, verify at the end of the re-run */
+static void r1_act(Ctx *c) {
     if (g_ff > 0 && g_phase < 3) {
         int idle = fibers_idle();
         if (!idle && g_wait_idle && (g_phase == 0 || g_phase == 1) && g_ff >= g_target) { g_postponed++; if (g_busy_log > 0) g_busy_log--; return; }   /* a job is half done: the next frame end */
@@ -1632,6 +1662,8 @@ void r1_init(void) {
     if (ra_wanted()) ra_init(); else g_ra = 0;
     int id = hook_install(GA(0x710386fc30ull), r1_frame_end, NULL, &g_orig_frame_end);
     LOG("r1: SSBU_R1 save at fight frame %d, %d frames, every %d frames, %d cycles; hook on the frame end 710386fc30: %s\n", g_n, g_k, g_p, g_c, id ? "installed" : "FAILED");
+    g_at_kick = getenv("SSBU_R1_AT_KICK") != NULL && g_ra <= 0;
+    if (g_at_kick) { int k = hook_install(0x7103549170ull, r1_kick2, NULL, &g_orig_r1k); LOG("r1: SSBU_R1_AT_KICK: save / restore at the kick after the submission (0x7103749b24), workers held from 0x71037494fc: %s\n", k ? "installed" : "FAILED"); if (!k) g_at_kick = 0; }
 }
 
 /* ---------------------------------------------------------------- the guest C heap inside the snapshot (SSBU_R1 only)

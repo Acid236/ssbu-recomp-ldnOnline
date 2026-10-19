@@ -79,3 +79,18 @@ unknown or expired". Best explanation so far: the R1 save point (main loop frame
 the next frame are in flight; run-ahead saves at the kick right after the submission (hook on 0x7103549170 from
 0x7103749b20), when no recording is in progress. Next: let R1 save / restore at run-ahead's point (no marks needed for
 that; the marks, `tests/r1_nro_build.py`, are only for the fast dirty-page tracking).
+
+# Round 3 (2026-10-19): the save point and the fibers born in the window
+
+| Cause found | Change | Effect |
+|---|---|---|
+| R1 saved at the main loop's frame end, with the next frame's render preparation jobs in flight on the task workers | `SSBU_R1_AT_KICK=1`: save / restore at run-ahead's point (the kick after the submission, 0x7103749b24), the task workers held from the kick before (0x71037494fc) | pages that differ after an identical re-run: 50 instead of up to 1288; no page changed only in the re-run |
+| The real cause of the guest trap and of a std::terminate ("f_720052e2f0 handled an exception but was not entered through nro_catch_call"): f_720052e2f0 is the lua2cpp coroutine wrapper that catches `L2CExceptionShutdown` (thrown in normal play when a fighter's script coroutine ends). Fibers the game made in the window kept, after the restore, a host fiber in the middle of the first pass's run; re-initialised by the re-run they resumed there | at a restore, every fiber object born in the window gets a fresh host fiber (starts from its entry), as a fiber that had never run at the save (`SSBU_R1_KEEP_BORN_FIBERS=1`: the old way) | no guest trap, no terminate: 7 of 8 cycles identical frame by frame |
+
+Still open: after 8 cycles a crash in the game's code on the main thread (null pointer), with "command handle unknown or
+expired" (64 in that run): the renderer's host objects (command buffers made and finalized inside the window) cannot
+be rolled back. A rollback does not need that: its re-simulated frames must run the logic only, without the render
+preparation (run-ahead already skips the preparation kicks of its speculative pass: `SSBU_RUNAHEAD_SKIP`). That is the
+next step, and it also gives the logic-only re-simulation time.
+
+`nnunwind.c` now also lists, when a handler finds no catch record, the records within 64 KB of that frame (diagnostic).
