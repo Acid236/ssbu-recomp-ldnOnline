@@ -1473,6 +1473,7 @@ static void ra_workers_hold(void) {
     g_ra_nwh = 0;
     for (int i = 0; guest_thread_info(i, &tc, &nm, &h) && g_ra_nwh < 16; i++) {
         if (!h || GetThreadId(h) == me || !nm || !strstr(nm, "TaskWorker")) continue;
+        { const char *sv = getenv("SSBU_R1_SOLO"); if (sv && strstr(sv, "keep0") && strstr(nm, "TaskWorker0")) continue; }      /* SSBU_R1_SOLO=keep0: one worker left running */
         if (SuspendThread(h) == (DWORD)-1) continue;
         if (!th_blocked(h)) { ResumeThread(h); g_ra_wh_fail++; continue; }      /* busy: not held (that pass will likely skip its save) */
         g_ra_wh[g_ra_nwh++] = h;
@@ -1586,9 +1587,27 @@ static int g_at_kick = -1, g_kick_due; static long long g_r1_skipped;
 static ImportFn g_orig_r1k;
 static void r1_act(Ctx *c);
 static void ra_workers_hold(void); static void ra_workers_release(void);
+/* rollback round 6, SSBU_R1_SOLO=1 (experiment): the task workers TaskWorker1/2 are suspended for good once the fight is
+ * on, each at a moment it is blocked at its idle wait; if the threads that wait for a job group run its jobs themselves,
+ * the fight goes on with no worker thread in parallel (nothing of theirs to save or restore) */
+static HANDLE g_solo_h[8]; static int g_solo_n;
+static void solo_hold(void) {
+    Ctx *tc; const char *nm; HANDLE h; DWORD me = GetCurrentThreadId();
+    for (int i = 0; guest_thread_info(i, &tc, &nm, &h); i++) {
+        if (!h || GetThreadId(h) == me || !nm || !strstr(nm, "TaskWorker")) continue;
+        { const char *sv = getenv("SSBU_R1_SOLO"); if (sv && strstr(sv, "keep0") && strstr(nm, "TaskWorker0")) continue; }      /* SSBU_R1_SOLO=keep0: one worker left running */
+        int k; for (k = 0; k < g_solo_n; k++) if (GetThreadId(g_solo_h[k]) == GetThreadId(h)) break;
+        if (k < g_solo_n || g_solo_n >= 8) continue;
+        if (SuspendThread(h) == (DWORD)-1) continue;
+        if (!th_blocked(h)) { ResumeThread(h); continue; }      /* busy now: the next kick tries again */
+        g_solo_h[g_solo_n++] = h;
+        LOG("r1: SOLO: %s suspended for good at fight frame %lld\n", nm, g_ff);
+    }
+}
 static void r1_kick2(Ctx *c, void *user) {
     (void)user;
     uint64_t lr = c->x[30];
+    { static int solo = -1; if (solo < 0) solo = getenv("SSBU_R1_SOLO") != NULL; if (solo && g_ff > 0 && lr == GA(0x71037494fcull)) solo_hold(); }
     if (lr == 0x71037494fcull && g_ff > 0 && g_phase < 3) ra_workers_hold();                       /* H1 */
     if (lr == 0x7103749b24ull) {                                                                     /* H2 */
         if (g_kick_due) { g_kick_due = 0; r1_act(c); }
@@ -1598,6 +1617,11 @@ static void r1_kick2(Ctx *c, void *user) {
      * render side are not kicked, so a re-simulated frame runs the logic only (1 = the preparation kicks, 2 = the render
      * kick, 4 = the logic kicks: only for tests) */
     static int skip = -1; if (skip < 0) { const char *e = getenv("SSBU_R1_RERUN_SKIP"); skip = e ? atoi(e) : 0; }
+    /* rollback round 6, SSBU_R1_RERUN_SKIP_AT=<hex>[,<hex>...]: the kicks to leave out of the re-run, by their return address
+     * (one group at a time, to tell the groups the fight depends on from the drawing-only ones) */
+    static uint64_t at[16]; static int nat = -1;
+    if (nat < 0) { nat = 0; const char *e = getenv("SSBU_R1_RERUN_SKIP_AT"); while (e && *e && nat < 16) { at[nat++] = strtoull(e, NULL, 16); e = strchr(e, ','); if (e) e++; } }
+    if (nat && g_phase == 2) for (int i = 0; i < nat; i++) if (lr == at[i]) { g_r1_skipped++; return; }
     if (skip && g_phase == 2) {
         int prep = lr == 0x7103749b24ull || lr == 0x710374b4f8ull || lr == 0x710374b528ull || lr == 0x710374b558ull, rend = lr == 0x710374c0d8ull;
         int logic = lr == 0x710374c398ull || lr == 0x710374c5b8ull;

@@ -133,3 +133,29 @@ separating the logic from the render preparation, which is deep engine work. Wha
 (at most 2 on a faster CPU) on top of a delay: e.g. delay 2 + rollback 1 covers what delay 3 covers today, with the
 input lag of delay 2; the misprediction cost is one re-simulated frame. Still needed for it: a save every frame in
 ~2 ms (FAST mode), and the intermittent coroutine trap fixed.
+
+# Round 6 (2026-10-19): toward a logic-only frame
+
+- A reproducible reference: two runs without R1 (`SSBU_DETERMINISTIC=1`, `SSBU_FIXED_SEED=1`, the same debug match and
+  input sequence) are identical for 5900 fight frames. `tests/r1_cmp.py <hash> <log> <K> <reference>` can then tell
+  whether a fight continues exactly as without save / restore. Note: give `SSBU_FIGHT_HASH` a path with forward
+  slashes; with backslashes the file was not created in some runs.
+- With the fixed seed the harness is less stable than without: the first re-run crashed (main thread, game code) with
+  nothing skipped, and with mask 1 the game deadlocked right after the first save. Other seeds, other paths, other
+  latent problems.
+- `SSBU_R1_RERUN_SKIP_AT=<hex>,...`: job group kicks left out of the re-run by their return address, to test the
+  groups one at a time. The main loop's kicks (13.0.4): 0x71037494f8, 0x7103749594, 0x7103749b20 (then waits),
+  0x710374b4f4 / b524 / b554 (waits b57c / b5a4 / b5cc), the wait at 0x710374c028 (run-ahead's "preparation done"),
+  0x710374c0d4 (render), 0x710374c394 / c5b4 (logic, waits c3f0 / c604), 0x710374cae4. Every kick passes a list of
+  job objects to the same runner 0x7103548240.
+- `SSBU_R1_SOLO=1` / `keep0` (experiment): the task workers suspended for good at the fight's start. With all of them
+  (there are TaskWorker0, two named TaskWorker1, TaskWorker2) or all but TaskWorker0, the fight never starts: the
+  threads that wait for a job group do not run its jobs, and jobs go to given workers. A single-threaded fight is not
+  available this way.
+- 30-frame re-runs without the preparation (mask 1): the first re-run crashed (guest trap) before any frame was
+  hashed: no answer yet to "does the preparation feed the logic over longer windows".
+
+Where this leaves the in-game half: the memory side is fine and small; what keeps breaking is the state the engine's
+other threads (task workers, audio, decoders, renderer) keep outside the snapshot or change during the window, a
+different part each time. A rollback needs either all of that made safe to save at one point every frame, or the
+fight's logic run apart from those threads; neither is a small step.
