@@ -491,6 +491,15 @@ static void save(Ctx *c) {
     if (g_fast > 0 && g_cycle < g_learn) async_learn();
     double tp0 = now_ms();
     if (g_ra > 0) { if (!ra_hold_quiet(200)) { LOG("r1: RA: first save: no quiet moment within 200 ms: not now\n"); g_save_failed = 1; return; } } else park_quiet(0);
+    if (g_ra <= 0) {     /* rollback round 2: a thread held away from a wait (park gave up after g_park_ms) would be saved in the
+                          * middle of its work, and its host stack is not in the snapshot: no save now, the next frame end tries again */
+        for (int i = 0; i < g_nth; i++) if (g_th[i].held && !g_th[i].parked) {
+            LOG("r1: save at fight frame %lld not now: %s is not at a wait\n", g_ff, g_th[i].name);
+            unpark(); audio_release();
+            for (int k = 0; k < g_nr; k++) { free(g_r[k].s); g_r[k].s = NULL; free(g_r[k].dirty); g_r[k].dirty = NULL; free(g_r[k].async); g_r[k].async = NULL; }
+            g_save_failed = 1; return;
+        }
+    }
     fibers_save();
     double t1b = now_ms();
     for (int i = 0; i < g_nr; i++) { memcpy(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
@@ -512,7 +521,7 @@ static void save(Ctx *c) {
             }
         }
         if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
-        if (g_ra > 0) nvn_r1_cb_save();
+        nvn_r1_cb_save();      /* the command buffers' recordings in progress (host data): run-ahead, and since rollback round 2 every R1 save (a restore left them recorded past the save point: "command handle unknown or expired", then a guest trap) */
         unpark();
         for (int i = 0; i < shown; i++) LOG("r1:   async page (written by host threads while main and the guest threads were held %d ms): %s\n", pause, where(g_e[i].a));
         LOG("r1: %zu pages written by host threads during a %d ms hold: left out of restore / verify; holding the guest threads took %.2f ms\n", np, pause, t1b - tp0);
@@ -602,6 +611,7 @@ static void restore(Ctx *c) {
     restore_thread_regs();
     fibers_restore();
     double t1 = now_ms();
+    nvn_r1_cb_restore();                                /* rollback round 2: the renderer's command buffers as at the save, while the threads are held */
     unpark();
     *c = g_ctx_save;                                   /* the main thread's guest registers at the save point */
     LOG("r1: holding the guest threads at their save-point waits took %.2f ms; %d of %d not at the same wait\n", t0 - tp0, g_th_mismatch, g_nth);
@@ -1567,7 +1577,7 @@ static void r1_frame_end(Ctx *c, void *user) {
         if (g_postponed) LOG("r1: save postponed %d frame end(s): a fiber was in the middle of a job\n", g_postponed);
         g_postponed = 0;
         if (g_mark > 0) { if (g_cycle == 0) save(c); else mark_save(c); }      /* (cycle 0: save() starts the marks itself) */
-        else if (g_fast > 0 && g_cycle >= g_learn) { if (!g_nfp) fast_build(); if (g_fcheck) save(c); fast_save(c); } else save(c);
+        else if (g_fast > 0 && g_cycle >= g_learn) { if (!g_nfp) fast_build(); if (g_fcheck) save(c); fast_save(c); } else { g_save_failed = 0; save(c); if (g_save_failed) { g_save_failed = 0; return; } }      /* not now: the next frame end */
         g_phase = 1; g_fe_busy = 1; g_npad = 0; g_save_ff = g_ff; g_target = g_ff + g_k; g_t_mark = now_ms();
     } else if (g_phase == 1 && g_ff >= g_target) {
         if (g_postponed) LOG("r1: restore postponed %d frame end(s): a fiber was in the middle of a job\n", g_postponed);

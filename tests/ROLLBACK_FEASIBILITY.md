@@ -60,3 +60,22 @@ the light build with the R1 harness and `SSBU_DEBUG_MATCH`, walks the menus with
 "fight" for the input sequence at the game's ready-go; `nnhid.c` keeps up to 1024 input marks (128 were filled by the
 script modules' `module:` marks before "fight"); `r1_state.c` also saves the script modules (`nro_bin_*`), not only
 `fighters_bin`.
+
+# Round 2 (2026-10-19): the restore crashes
+
+Each change below was tested with `SSBU_R1=600,8,60,10`, `SSBU_DETERMINISTIC=1`, `SSBU_R1_QUIET=1`.
+
+| Cause found | Change | Effect |
+|---|---|---|
+| A guest catch (`nro_catch_call`) longjmp'd on a fiber stack an R1 restore had put back: Windows' unwind refused it (`c00000ff` in ntdll, stack: `nro_catch_call`) | nnunwind.c: `__builtin_setjmp` / `__builtin_longjmp` (a direct jump, no RtlUnwindEx; the frames in between are C, nothing to unwind) | that crash is gone |
+| Keeping the CURRENT fiber stack limits at a restore (a guess) | reverted | made it worse (crash at the first re-run) |
+| The audio thread ran in the window; rolling its memory back broke it (`nus3::audio update` crashes); leaving it out of the snapshot (`SSBU_R1_AUDIO_FREE`) shifts the re-run's random numbers (rngcalls 3599 vs 3682): audio draws from the game's random numbers | `SSBU_R1_AUDIO_HOLD=1`: the audio threads stay suspended from the save to the end of the re-run (as run-ahead does) | 7 of 7 cycles identical frame by frame |
+| A save with a thread held away from a wait (park gave up after 500 ms: "NOT PARKED") was the one that crashed later | the save is skipped and tried again at the next frame end | no save in the middle of a thread's work |
+| The renderer's command buffers (host objects) were not part of an R1 save (only run-ahead saved them): "command handle unknown or expired" right before a guest trap | `nvn_r1_cb_save` / `nvn_r1_cb_restore` at every R1 save / restore | fewer, not none: buffers created AND finalized inside the window cannot come back |
+
+Still open: an intermittent guest trap, always the same (`indirect call to lua2cpp_common+0x52e434`, from
+`f_710353c400` at 0x71037cc55c: a callable object on a task fiber's guest stack, vtable call), after "command handle
+unknown or expired". Best explanation so far: the R1 save point (main loop frame end) is taken while the render jobs of
+the next frame are in flight; run-ahead saves at the kick right after the submission (hook on 0x7103549170 from
+0x7103749b20), when no recording is in progress. Next: let R1 save / restore at run-ahead's point (no marks needed for
+that; the marks, `tests/r1_nro_build.py`, are only for the fast dirty-page tracking).
