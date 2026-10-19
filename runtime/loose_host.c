@@ -28,6 +28,9 @@ static DWORD WINAPI loose_host_wait(LPVOID arg) {
     const char *ee = getenv("SSBU_LOOSE_EARLY");
     int hooked = 0, early = !(ee && ee[0] == '0');
     for (int i = 0; i < 120000; i++) {
+        /* game addresses go through GA() since 13.0.5 came next to 13.0.4, and GA() stops the game when it is asked
+         * before main.elf has been read (hostrt.c load_layout sets g_game_build): nothing until the version is known */
+        if (g_game_build < 0) { Sleep(1); continue; }
         if (!hooked && i % 10 == 0) hooked = loose_files_install(hook_install, 1);
         if (early && loose_files_early()) early = 0;
         if (hooked && !early) return 0;
