@@ -135,7 +135,7 @@ static void add_fighter_dlls(void) {
     MODULEENTRY32 me; me.dwSize = sizeof me;
     int nmod = 0; size_t bytes = 0;
     for (BOOL ok = Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
-        if (!strstr(me.szExePath, "fighters_bin") || getenv("SSBU_R1_NO_DLLS")) continue;
+        if ((!strstr(me.szExePath, "fighters_bin") && !strstr(me.szExePath, "nro_bin")) || getenv("SSBU_R1_NO_DLLS")) continue;      /* + the script modules (nro_bin_**.dll) */
         uint8_t *b = me.modBaseAddr;
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
         IMAGE_SECTION_HEADER *sh = IMAGE_FIRST_SECTION(nt);

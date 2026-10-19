@@ -105,7 +105,7 @@ static int script_key(int vk) {
  * Example: "@movie 90:Z 120:Z @draws:150-200 300:u/40 10:Z". Each step is announced with the poll number and the
  * draw count of the last frame. tests\seq_battle.txt is the sequence from boot to a battle (tests\run_battle.sh). */
 #define SEQ_MAX 256
-#define MARK_MAX 128
+#define MARK_MAX 1024                                     /* every script module adds one (module:<name>): 128 filled up before "fight" */
 enum { SEQ_KEYS = 0, SEQ_MARK, SEQ_DRAWS, SEQ_UNTIL };
 static struct { int wait, hold, kind, lo, hi, need; char keys[12]; char mark[40]; } g_seq[SEQ_MAX];
 static int g_seq_count = -1, g_seq_index, g_seq_left, g_seq_holding, g_seq_run;
