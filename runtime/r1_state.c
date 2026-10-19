@@ -133,7 +133,7 @@ static void add_fighter_dlls(void) {
     MODULEENTRY32 me; me.dwSize = sizeof me;
     int nmod = 0; size_t bytes = 0;
     for (BOOL ok = Module32First(sn, &me); ok; ok = Module32Next(sn, &me)) {
-        if (!strstr(me.szExePath, "fighters_bin") || getenv("SSBU_R1_NO_DLLS")) continue;
+        if ((!strstr(me.szExePath, "fighters_bin") && !strstr(me.szExePath, "nro_bin")) || getenv("SSBU_R1_NO_DLLS")) continue;      /* + the script modules (nro_bin_**.dll) */
         uint8_t *b = me.modBaseAddr;
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
         IMAGE_SECTION_HEADER *sh = IMAGE_FIRST_SECTION(nt);
@@ -273,7 +273,20 @@ static void slow_report(const char *when) {        /* which thread made the hold
     b[o] = 0;
     if (o) LOG("r1: hold %s: slow threads:%s\n", when, b);
 }
-static void unpark(void) { for (int i = 0; i < g_nth; i++) if (g_th[i].held) { ResumeThread(g_th[i].h); g_th[i].held = 0; } }
+/* rollback round 2, SSBU_R1_AUDIO_HOLD=1: the audio threads stay suspended from the save to the end of the re-run (as the
+ * run-ahead does): they draw from the game's random numbers and keep host-side audio state, so letting them run in the
+ * window and then rolling their memory back put the game's and the host's audio out of step (crashes in
+ * nus3::audio update) or, left out of the snapshot (SSBU_R1_AUDIO_FREE), shifted the random sequence of the re-run */
+static int g_audio_hold = -1, g_aud_cnt[256];
+static int is_audio_th(const char *n) { return n && (strstr(n, "nus3") || strstr(n, "udio") || strstr(n, "sindou")); }
+static void unpark(void) {
+    if (g_audio_hold < 0) g_audio_hold = getenv("SSBU_R1_AUDIO_HOLD") != NULL;
+    for (int i = 0; i < g_nth; i++) if (g_th[i].held) {
+        if (g_audio_hold && is_audio_th(g_th[i].name)) { g_aud_cnt[i]++; g_th[i].held = 0; continue; }      /* stays suspended */
+        ResumeThread(g_th[i].h); g_th[i].held = 0;
+    }
+}
+static void audio_release(void) { for (int i = 0; i < g_nth; i++) while (g_aud_cnt[i] > 0) { ResumeThread(g_th[i].h); g_aud_cnt[i]--; } }
 static void restore_thread_regs(void) {     /* callee-saved registers + sp of each thread held at the same wait as at the save */
     for (int i = 0; i < g_nth; i++) {
         Th *t = &g_th[i];
@@ -299,6 +312,7 @@ void os_r1_fibers(void (*cb)(uint64_t key, Ctx *c, uint64_t stack, uint64_t stac
  * copied with its guest context (Ctx); a restore puts all three back when the fiber is switched away then too. */
 #define FIB_BLOCK 0x500
 typedef struct { uint64_t key; uint64_t obj[6]; void *fls; uint8_t flsb[72]; Ctx *c; void *fiber; Ctx regs; const char *imp; uint64_t from, sp; int susp; uint8_t blk[FIB_BLOCK]; uint8_t *stk; size_t n; uint64_t rsp; } Fib;
+static int g_fib_other_running, g_fib_other_tries; static uint64_t g_fib_other_key, g_fib_other_from; static DWORD g_fib_other_tid; static const char *g_fib_other_imp;      /* rollback round 5: fibers running on another thread at the save */
 static Fib g_fib[1024]; static int g_fib_running, g_nfib, g_fib_mode, g_fib_same, g_fib_diff, g_fib_new, g_fib_bad;
 void os_r1_fiber_set(uint64_t key, void *fiber, Ctx *fctx, int fresh);
 void os_r1_fiber_get(uint64_t key, uint64_t v[6]); void os_r1_fiber_put(uint64_t key, const uint64_t v[6]);
@@ -357,6 +371,7 @@ static void fib_cb(uint64_t key, Ctx *c, uint64_t stack, uint64_t size, void *fi
         }
     } else if (!tid) g_fib_bad++;
     if (tid) g_fib_running++;
+    if (tid && tid != GetCurrentThreadId()) { g_fib_other_running++; g_fib_other_key = key; g_fib_other_tid = tid; g_fib_other_imp = c ? c->in_import : NULL; g_fib_other_from = c ? c->import_from : 0; }
 }
 static void fibers_restore_all(void) {
     g_ncur = 0; g_fib_mode = 1; os_r1_fibers(fib_cb);
@@ -433,10 +448,16 @@ static void park_quiet(int restore_mode) {
         unpark(); SwitchToThread();
     }
 }
-static void fibers_save(void) { g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
+static void fibers_save(void) { g_fib_other_running = 0; g_nfib = 0; g_fib_mode = 0; g_ncur = 0; g_fpool_used = 0; g_fib_bytes = 0; g_fib_bad = 0; g_fib_running = 0; os_r1_fibers(fib_cb); }
 static void fibers_restore(void) {
     fibers_restore_all();
-    int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == g_cur[j].key) break; if (i == g_nfib) born++; }
+    /* rollback round 3: a fiber object the game made in the window has, after the restore, no state in guest memory (or an
+     * older one), but its host fiber still sits in the middle of what it ran in the first pass. When the re-run initialises
+     * it again, the host must start it from the beginning (as a fiber that never ran at the save): left as it was, it resumed
+     * mid-function (a lua2cpp coroutine: "indirect call to lua2cpp_common+0x52e434", or its L2CExceptionShutdown handler
+     * finding no catch record -> std::terminate). SSBU_R1_KEEP_BORN_FIBERS=1: the old behaviour. */
+    int born = 0; for (int j = 0; j < g_ncur; j++) { int i; for (i = 0; i < g_nfib; i++) if (g_fib[i].key == g_cur[j].key) break;
+        if (i == g_nfib) { born++; if (!getenv("SSBU_R1_KEEP_BORN_FIBERS") && !g_cur[j].tid) os_r1_fiber_set(g_cur[j].key, NULL, NULL, 1); } }
     Ctx *tc; const char *nm; HANDLE h; int nt = 0; for (int i = 0; guest_thread_info(i, &tc, &nm, &h); i++) nt++;
     if (g_nborn) LOG("r1: %d guest threads created in the window, held for good at the restore:%s\n", g_nborn, g_born);
     LOG("r1: in the window: %d fiber objects made that the save did not have; guest threads now %d (at the save %d + this one)\n", born, nt, g_nth);
@@ -473,7 +494,29 @@ static void save(Ctx *c) {
     if (g_fast > 0 && g_cycle < g_learn) async_learn();
     double tp0 = now_ms();
     if (g_ra > 0) { if (!ra_hold_quiet(200)) { LOG("r1: RA: first save: no quiet moment within 200 ms: not now\n"); g_save_failed = 1; return; } } else park_quiet(0);
+    if (g_ra <= 0) {     /* rollback round 2: a thread held away from a wait (park gave up after g_park_ms) would be saved in the
+                          * middle of its work, and its host stack is not in the snapshot: no save now, the next frame end tries again */
+        for (int i = 0; i < g_nth; i++) if (g_th[i].held && !g_th[i].parked) {
+            LOG("r1: save at fight frame %lld not now: %s is not at a wait\n", g_ff, g_th[i].name);
+            unpark(); audio_release();
+            for (int k = 0; k < g_nr; k++) { free(g_r[k].s); g_r[k].s = NULL; free(g_r[k].dirty); g_r[k].dirty = NULL; free(g_r[k].async); g_r[k].async = NULL; }
+            g_save_failed = 1; return;
+        }
+    }
     fibers_save();
+    if (g_ra <= 0 && g_fib_other_running && getenv("SSBU_R1_NO_RUNNING_FIBERS") && ++g_fib_other_tries <= 30) {      /* opt-in: the one seen is TaskWorker2's idle loop (WaitLightEvent @710354a5a8), there at every save point */
+        /* rollback round 5: a fiber running on ANOTHER thread (held at a wait inside a job) keeps host state that the
+         * snapshot does not have: lifted code holds guest values in host registers / locals across that wait, and if the
+         * job goes round and waits at the same place again before the restore, it continues with values of the first
+         * pass (the coroutine trap at lua2cpp_common+0x52e434: a stale pointer into a guest stack). No save now. */
+        { const char *tn = "?"; Ctx *tc2; const char *nm2; HANDLE h2; for (int q = 0; guest_thread_info(q, &tc2, &nm2, &h2); q++) if (h2 && GetThreadId(h2) == g_fib_other_tid) tn = nm2 ? nm2 : "?";
+          LOG("r1: save at fight frame %lld not now (%d): %d fiber(s) running on another thread (e.g. %llx on %s, thread %lu, in %s @%llx)\n", g_ff, g_fib_other_tries, g_fib_other_running, (unsigned long long)g_fib_other_key, tn, (unsigned long)g_fib_other_tid, g_fib_other_imp ? g_fib_other_imp : "guest code", (unsigned long long)g_fib_other_from); }
+        unpark(); audio_release();
+        for (int k = 0; k < g_nr; k++) { free(g_r[k].s); g_r[k].s = NULL; free(g_r[k].dirty); g_r[k].dirty = NULL; free(g_r[k].async); g_r[k].async = NULL; }
+        g_save_failed = 1; return;
+    }
+    if (g_fib_other_running) LOG("r1: saving with %d fiber(s) running on another thread (after %d tries)\n", g_fib_other_running, g_fib_other_tries - 1);
+    g_fib_other_tries = 0;
     double t1b = now_ms();
     for (int i = 0; i < g_nr; i++) { memcpy(g_r[i].s, g_r[i].a, g_r[i].n); g_saved_bytes += g_r[i].n; }
     double t2 = now_ms();
@@ -494,7 +537,7 @@ static void save(Ctx *c) {
             }
         }
         if (g_mark > 0 && g_cycle == 0) { g_ctx_save = *c; mark_setup(); }     /* round 5: the marks start while the threads are still held (no unmarked gap after this full save) */
-        if (g_ra > 0) nvn_r1_cb_save();
+        nvn_r1_cb_save();      /* the command buffers' recordings in progress (host data): run-ahead, and since rollback round 2 every R1 save (a restore left them recorded past the save point: "command handle unknown or expired", then a guest trap) */
         unpark();
         for (int i = 0; i < shown; i++) LOG("r1:   async page (written by host threads while main and the guest threads were held %d ms): %s\n", pause, where(g_e[i].a));
         LOG("r1: %zu pages written by host threads during a %d ms hold: left out of restore / verify; holding the guest threads took %.2f ms\n", np, pause, t1b - tp0);
@@ -584,6 +627,7 @@ static void restore(Ctx *c) {
     restore_thread_regs();
     fibers_restore();
     double t1 = now_ms();
+    nvn_r1_cb_restore();                                /* rollback round 2: the renderer's command buffers as at the save, while the threads are held */
     unpark();
     *c = g_ctx_save;                                   /* the main thread's guest registers at the save point */
     LOG("r1: holding the guest threads at their save-point waits took %.2f ms; %d of %d not at the same wait\n", t0 - tp0, g_th_mismatch, g_nth);
@@ -1095,6 +1139,19 @@ static LONG CALLBACK r1_veh(EXCEPTION_POINTERS *e) {
     { HMODULE m = NULL; char mn[MAX_PATH] = "?"; if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)e->ContextRecord->Rip, &m)) GetModuleFileNameA(m, mn, MAX_PATH);
       LOG("r1: CRASH module %s +%llx; rcx %llx rdx %llx; TEB fiber data %p; [rsp] %llx %llx %llx %llx\n", mn, (unsigned long long)(e->ContextRecord->Rip - (uint64_t)(uintptr_t)m), (unsigned long long)e->ContextRecord->Rcx, (unsigned long long)e->ContextRecord->Rdx, GetCurrentFiber(),
           (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[0], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[1], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[2], (unsigned long long)((uint64_t *)(uintptr_t)g_veh_rsp)[3]); }
+    {   /* rollback round 2: the host return addresses above rsp (code of this exe or a module), to name with the map */
+        char b[2048]; int o = 0, k = 0;
+        for (uint64_t *p = (uint64_t *)(uintptr_t)g_veh_rsp; k < 28 && (uint8_t *)p < (uint8_t *)(uintptr_t)g_veh_rsp + 24576; p++) {
+            MEMORY_BASIC_INFORMATION mi;
+            if (((uintptr_t)p & 4095) == 0 && (!VirtualQuery(p, &mi, sizeof mi) || mi.State != MEM_COMMIT)) break;
+            HMODULE m = NULL;
+            if (*p < 0x10000 || !GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)*p, &m)) continue;
+            char mn[MAX_PATH]; GetModuleFileNameA(m, mn, MAX_PATH); const char *bn = strrchr(mn, '\\') ? strrchr(mn, '\\') + 1 : mn;
+            o += snprintf(b + o, sizeof b - o, " [+%llx] %s+%llx", (unsigned long long)((uint8_t *)p - (uint8_t *)(uintptr_t)g_veh_rsp), bn, (unsigned long long)(*p - (uint64_t)(uintptr_t)m));
+            if (o > 1900) break; k++;
+        }
+        LOG("r1: CRASH stack:%s\n", b);
+    }
     os_r1_fibers(veh_fib_cb);
     if (!g_veh_hits) LOG("r1: CRASH rsp is on no fiber's host stack\n");
     return EXCEPTION_CONTINUE_SEARCH;
@@ -1482,6 +1539,34 @@ static void r1_stats_now(void) {
         LOG("r1: TIMING %s frames (%lld): poll -> frame end %.3f ms, frame end call %.3f ms, frame end -> frame end %.3f ms (means, main thread, wall)\n",
             k ? "re-run" : "normal", g_stn[k], g_st[k][0] / g_stn[k], g_st[k][1] / g_stn[k], g_st[k][2] / g_stn[k]);
 }
+/* rollback round 3, SSBU_R1_AT_KICK=1: R1 saves and restores where run-ahead does, at the kick right after the
+ * submission (FUN 0x7103549170 called from 0x7103749b20), not at the main loop's frame end: at the frame end the render
+ * preparation jobs of the next frame are in flight on the task workers (a restore there left command buffers recorded
+ * past the save point and fibers mid-job: "command handle unknown or expired", then a guest trap). As run-ahead, the
+ * task workers are held from the kick before (0x71037494f8, H1: they are idle there) to that point (H2). */
+static int g_at_kick = -1, g_kick_due; static long long g_r1_skipped;
+static ImportFn g_orig_r1k;
+static void r1_act(Ctx *c);
+static void ra_workers_hold(void); static void ra_workers_release(void);
+static void r1_kick2(Ctx *c, void *user) {
+    (void)user;
+    uint64_t lr = c->x[30];
+    if (lr == GA(0x71037494fcull) && g_ff > 0 && g_phase < 3) ra_workers_hold();                       /* H1 */
+    if (lr == GA(0x7103749b24ull)) {                                                                     /* H2 */
+        if (g_kick_due) { g_kick_due = 0; r1_act(c); }
+        ra_workers_release();
+    }
+    /* rollback round 4, SSBU_R1_RERUN_SKIP=<mask> (as run-ahead's SSBU_RUNAHEAD_SKIP): in the re-run, the job groups of the
+     * render side are not kicked, so a re-simulated frame runs the logic only (1 = the preparation kicks, 2 = the render
+     * kick, 4 = the logic kicks: only for tests) */
+    static int skip = -1; if (skip < 0) { const char *e = getenv("SSBU_R1_RERUN_SKIP"); skip = e ? atoi(e) : 0; }
+    if (skip && g_phase == 2) {
+        int prep = lr == GA(0x7103749b24ull) || lr == GA(0x710374b4f8ull) || lr == GA(0x710374b528ull) || lr == GA(0x710374b558ull), rend = lr == GA(0x710374c0d8ull);
+        int logic = lr == GA(0x710374c398ull) || lr == GA(0x710374c5b8ull);
+        if (((skip & 1) && prep) || ((skip & 2) && rend) || ((skip & 4) && logic)) { g_r1_skipped++; return; }
+    }
+    g_orig_r1k(c);
+}
 static void r1_frame_end(Ctx *c, void *user) {
     (void)user;
     uint64_t lr = c->x[30];
@@ -1494,6 +1579,25 @@ static void r1_frame_end(Ctx *c, void *user) {
     g_t_fe_prev = te;
     { static long long nfe; if (++nfe % 600 == 0) { LOG("r1: (frame end %lld)\n", nfe); r1_stats_now(); } } { int ph = g_phase; static int last_ph; g_fe_busy = 0; (void)last_ph; last_ph = ph; }
     fls_index_find();
+    if (g_at_kick) { g_kick_due = 1; return; }          /* SSBU_R1_AT_KICK: the save / restore runs at the next kick after the submission */
+    r1_act(c);
+}
+static double cpu_ms(void) {      /* this thread's CPU time: its cycle count (QueryThreadCycleTime) at the rate calibrated once on the clock */
+    static double cyc_per_ms;
+    if (!cyc_per_ms) { ULONG64 c0, c1; QueryThreadCycleTime(GetCurrentThread(), &c0); double t0 = now_ms(); while (now_ms() - t0 < 20.0) { } QueryThreadCycleTime(GetCurrentThread(), &c1); cyc_per_ms = (double)(c1 - c0) / (now_ms() - t0); }
+    ULONG64 c; QueryThreadCycleTime(GetCurrentThread(), &c); return (double)c / cyc_per_ms;
+}
+static double g_cpu_mark, g_cpu_pass1;
+static double g_cpu_w_mark, g_cpu_w_pass1;   /* the same for the task workers (the logic's job groups run there too) */
+static double workers_ms(void) {
+    static double cyc_per_ms; if (!cyc_per_ms) { double t = cpu_ms(); (void)t; ULONG64 c0, c1; QueryThreadCycleTime(GetCurrentThread(), &c0); double t0 = now_ms(); while (now_ms() - t0 < 5.0) { } QueryThreadCycleTime(GetCurrentThread(), &c1); cyc_per_ms = (double)(c1 - c0) / (now_ms() - t0); }
+    ULONG64 sum = 0, c;
+    for (int i = 0; i < g_nth; i++) if (g_th[i].name && strstr(g_th[i].name, "TaskWorker") && QueryThreadCycleTime(g_th[i].h, &c)) sum += c;
+    return (double)sum / cyc_per_ms;
+}
+      /* rollback round 4: main thread CPU time of the first pass / the re-run (no wait for the display in it) */
+/* the R1 state machine: save at fight frame N, restore K frames later, verify at the end of the re-run */
+static void r1_act(Ctx *c) {
     if (g_ff > 0 && g_phase < 3) {
         int idle = fibers_idle();
         if (!idle && g_wait_idle && (g_phase == 0 || g_phase == 1) && g_ff >= g_target) { g_postponed++; if (g_busy_log > 0) g_busy_log--; return; }   /* a job is half done: the next frame end */
@@ -1502,22 +1606,24 @@ static void r1_frame_end(Ctx *c, void *user) {
         if (g_postponed) LOG("r1: save postponed %d frame end(s): a fiber was in the middle of a job\n", g_postponed);
         g_postponed = 0;
         if (g_mark > 0) { if (g_cycle == 0) save(c); else mark_save(c); }      /* (cycle 0: save() starts the marks itself) */
-        else if (g_fast > 0 && g_cycle >= g_learn) { if (!g_nfp) fast_build(); if (g_fcheck) save(c); fast_save(c); } else save(c);
-        g_phase = 1; g_fe_busy = 1; g_npad = 0; g_save_ff = g_ff; g_target = g_ff + g_k; g_t_mark = now_ms();
+        else if (g_fast > 0 && g_cycle >= g_learn) { if (!g_nfp) fast_build(); if (g_fcheck) save(c); fast_save(c); } else { g_save_failed = 0; save(c); if (g_save_failed) { g_save_failed = 0; return; } }      /* not now: the next frame end */
+        g_phase = 1; g_fe_busy = 1; g_npad = 0; g_save_ff = g_ff; g_target = g_ff + g_k; g_t_mark = now_ms(); g_cpu_mark = cpu_ms(); g_cpu_w_mark = workers_ms();
     } else if (g_phase == 1 && g_ff >= g_target) {
         if (g_postponed) LOG("r1: restore postponed %d frame end(s): a fiber was in the middle of a job\n", g_postponed);
         g_postponed = 0; g_k_run = (int)(g_ff - g_save_ff);
-        g_t_pass1 = now_ms() - g_t_mark;
+        g_t_pass1 = now_ms() - g_t_mark; g_cpu_pass1 = cpu_ms() - g_cpu_mark; g_cpu_w_pass1 = workers_ms() - g_cpu_w_mark;
         if (g_mark > 0) mark_restore(c);
         else if (g_fast > 0 && g_cycle >= g_learn) fast_restore(c); else restore(c);
-        g_phase = 2; g_fe_busy = 1; g_ipad = 0; g_ff = g_save_ff; g_target = g_ff + g_k_run; g_t_mark = now_ms();
+        g_phase = 2; g_fe_busy = 1; g_ipad = 0; g_ff = g_save_ff; g_target = g_ff + g_k_run; g_t_mark = now_ms(); g_cpu_mark = cpu_ms(); g_cpu_w_mark = workers_ms();
         if (g_ar) LOG("r1: guest C heap: %llu allocations, %llu frees so far (counters inside the heap: rolled back too)\n", (unsigned long long)((uint64_t *)g_ar)[50], (unsigned long long)((uint64_t *)g_ar)[51]);
         LOG("r1: first pass %d frames in %.2f ms (%.2f ms per frame, wall, render included); %d pad polls recorded\n", g_k_run, g_t_pass1, g_t_pass1 / g_k_run, g_npad);
     } else if (g_phase == 2 && g_ff == g_target) {
         g_t_rerun = now_ms() - g_t_mark;
+        LOG("r1: CPU per frame: main thread first pass %.2f ms, re-run %.2f ms; task workers first pass %.2f ms, re-run %.2f ms (%lld job group kicks skipped in re-runs so far)\n", g_cpu_pass1 / g_k_run, (cpu_ms() - g_cpu_mark) / g_k_run, g_cpu_w_pass1 / g_k_run, (workers_ms() - g_cpu_w_mark) / g_k_run, g_r1_skipped);
         LOG("r1: re-run %d frames in %.2f ms (%.2f ms per frame); %d of %d recorded pad polls given\n", g_k_run, g_t_rerun, g_t_rerun / g_k_run, g_ipad, g_npad);
         if (g_mark <= 0 && (!(g_fast > 0 && g_cycle >= g_learn) || g_fcheck)) verify();
         release(); g_fe_busy = 1;
+        audio_release();                                          /* SSBU_R1_AUDIO_HOLD: the audio threads go on */
         g_cycle++;
         if (g_cycle < g_c) { g_phase = 0; g_target = g_ff + g_p - g_k_run; } else { g_phase = 3; LOG("r1: done, %d cycles\n", g_cycle); fast_report(); mark_report(); if (g_prot > 0) prot_report(); r1_stats_report(); }
     }
@@ -1553,6 +1659,8 @@ void r1_init(void) {
     if (ra_wanted()) ra_init(); else g_ra = 0;
     int id = hook_install(GA(0x710386fc30ull), r1_frame_end, NULL, &g_orig_frame_end);
     LOG("r1: SSBU_R1 save at fight frame %d, %d frames, every %d frames, %d cycles; hook on the frame end 710386fc30: %s\n", g_n, g_k, g_p, g_c, id ? "installed" : "FAILED");
+    g_at_kick = getenv("SSBU_R1_AT_KICK") != NULL && g_ra <= 0;
+    if (g_at_kick) { int k = hook_install(GA(0x7103549170ull), r1_kick2, NULL, &g_orig_r1k); LOG("r1: SSBU_R1_AT_KICK: save / restore at the kick after the submission (0x7103749b24), workers held from 0x71037494fc: %s\n", k ? "installed" : "FAILED"); if (!k) g_at_kick = 0; }
 }
 
 /* ---------------------------------------------------------------- the guest C heap inside the snapshot (SSBU_R1 only)

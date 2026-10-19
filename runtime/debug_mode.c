@@ -91,6 +91,7 @@ void debug_mode_frame(long long frame) {
     if (!was_go) { was_go = 1; InterlockedExchange64(&g_end_fight_frames, 0); }
     LONG64 n = InterlockedIncrement64(&g_end_fight_frames);
     if (n == 1) {
+        { void input_mark(const char *what); input_mark("fight"); }      /* nnhid.c: the input sequence's @fight (R1 counts fight frames from it) */
         g_end_first_frame = frame;
         uint64_t sel = GA(0x71053097c0ull) + 0x20ull * (rd32(GA(0x7105309968ull)) < 3 ? rd32(GA(0x7105309968ull)) : 0);
         uint64_t r0 = fighter_info_record(0), r1 = fighter_info_record(1);

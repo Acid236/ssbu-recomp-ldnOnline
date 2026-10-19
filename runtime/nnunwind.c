@@ -214,7 +214,7 @@ void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t)) {
     const char *volatile in_import = c->in_import;
     volatile uint64_t import_from = c->import_from;
     catch_put(cfa, &jb);
-    if (setjmp(jb) == 0) {
+    if (__builtin_setjmp((void **)jb) == 0) {             /* rollback round 2: the builtin pair jumps straight back, without Windows' unwind of the host frames in between (C code, nothing to unwind); RtlUnwindEx refused it (c00000ff) on a fiber stack an R1 restore had put back */
         body(c, 0);
         catch_take(cfa, &jb);
     } else {                                              /* a handler of this function ran it to its end (the unwinder removed the record) */
@@ -314,9 +314,17 @@ static void eh_raise(Ctx *c, int reason) {
         jmp_buf *jb = catch_take(cfa, NULL);
         if (!jb) {
             printf("\nunwind: f_%llx handled an exception but was not entered through nro_catch_call (frame %llx)\n", (unsigned long long)pad.function.start, (unsigned long long)cfa);
+            {   /* rollback round 3: the records near that frame (same guest stack within 64 KB), to tell a lost record from one under another key */
+                int shown = 0;
+                for (unsigned i = 0; i < CATCH_SLOTS && shown < 16; i++) {
+                    uint64_t k = g_catch[i].cfa;
+                    if (k > 1 && (k > cfa ? k - cfa : cfa - k) < 0x10000) { printf("unwind:   record slot %u: frame %llx (%+lld) jb %p\n", i, (unsigned long long)k, (long long)(k - cfa), (void *)g_catch[i].jb); shown++; }
+                }
+                printf("unwind:   %d records within 64 KB of that frame; host sp now %p\n", shown, (void *)&shown);
+            }
             eh_terminate(c, "no host frame to return to");
         }
-        longjmp(*jb, 1);
+        __builtin_longjmp((void **)*jb, 1);
     }
     printf("\nunwind: ran out of frames while unwinding (%s)\n", stop);
     eh_terminate(c, "unwinding ran past the last frame");
